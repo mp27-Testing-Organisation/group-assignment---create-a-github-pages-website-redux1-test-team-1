@@ -1,0 +1,54 @@
+{
+    "tests": [
+      {
+        "name": "Activity 1 - Enable GH Pages",
+        "setup": "",
+        "run": "[ -e .github/results/activity1.txt ] && exit 0 || exit 1",
+        "input": "",
+        "output": "",
+        "comparison": "included",
+        "timeout": 10,
+        "points": 1
+      },
+      {
+        "name": "Activity 2 - Add file and make commit",
+        "setup": "",
+        "run": "[ -e .github/results/activity2.txt ] && exit 0 || exit 1",
+        "input": "",
+        "output": "",
+        "comparison": "included",
+        "timeout": 10,
+        "points": 1
+      },
+      {
+        "name": "Activity 3 - Open PR",
+        "setup": "",
+        "run": "[ -e .github/results/activity3.txt ] && exit 0 || exit 1",
+        "input": "",
+        "output": "",
+        "comparison": "included",
+        "timeout": 10,
+        "points": 1
+      },
+      {
+        "name": "Activity 4 - Comment on PR",
+        "setup": "",
+        "run": "[ -e .github/results/activity4.txt ] && exit 0 || exit 1",
+        "input": "",
+        "output": "",
+        "comparison": "included",
+        "timeout": 10,
+        "points": 1
+      },
+      {
+        "name": "Activity 5 - Merge",
+        "setup": "",
+        "run": "[ -e .github/results/activity5.txt ] && exit 0 || exit 1",
+        "input": "",
+        "output": "",
+        "comparison": "included",
+        "timeout": 10,
+        "points": 1
+      }
+    ]
+}
