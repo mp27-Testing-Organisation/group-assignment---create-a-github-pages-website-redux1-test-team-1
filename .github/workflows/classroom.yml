@@ -1,0 +1,960 @@
+name: GitHub Classroom Workflow
+
+on: 
+  push:
+    branches:
+    - '*'
+    - '!status'
+    - '!feedback'
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  # job to run autograding
+  grade:
+    name: Autograding
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # need to checkout whole repo
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      # delete and recreate result dir
+      - name: Reset results dir
+        run: |
+          rm -rf .github/results
+          mkdir -p .github/results
+
+      # test activity 1 - enable gh pages
+      - uses: actions/github-script@v5
+        name: "Check Activity 1 - Enable GH Pages"
+        id: activity1
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            let result = 'fail';
+            let pageURL = '';
+            let sourceBranch = '';
+            let sourcePath = '';
+
+            // get pages
+            try {
+              const res = await github.rest.repos.getPages({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              console.log(`Get pages response: ${res.status}`);
+
+              if (res.status == '200') {
+                console.log(`Found GitHub Pages site`)
+                pageURL = res.data.html_url;
+                sourceBranch = res.data.source.branch;
+                sourcePath = res.data.source.path;
+                console.log(`Pages URL: ${pageURL}`);
+                console.log(`Source branch: ${sourceBranch}`);
+                console.log(`Source path  : ${sourcePath}`);
+
+                if (sourceBranch == 'main' && sourcePath == '/docs') {
+                  // write result to file
+                  const fs = require('fs');
+                  fs.writeFile('.github/results/activity1.txt', 'pass', function (err) {
+                    if (err) return console.log(err);
+                  });
+                  result = 'success';
+                }
+              }
+            }
+            catch(err) {
+              console.log(err);
+            }
+
+            core.setOutput('url', pageURL);
+            core.setOutput('branch', sourceBranch);
+            core.setOutput('path', sourcePath);
+            return result;
+          result-encoding: string
+
+      - name: Get page outputs
+        run: |
+          echo "${{steps.activity1.outputs.url}}"
+          echo "${{steps.activity1.outputs.branch}}"
+          echo "${{steps.activity1.outputs.path}}"
+
+      # get repo team members
+      # need a PAT scoped to read:org to get team list and team members
+      - uses: actions/github-script@v5
+        name: "Get Team Members"
+        id: team-members
+        with:
+          github-token: ${{secrets.READORG}}
+          script: |
+            let members = [];
+
+            try {
+              // get repo teams
+              const resTeams = await github.rest.repos.listTeams({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              console.log(`List teams response: ${resTeams.status}`);
+
+              // make assumption assignment team will be first in list
+              const teamSlug = resTeams.data[0].slug;
+              console.log(`Team slug: ${teamSlug}`);
+
+              // get team members
+              const resMembers = await github.rest.teams.listMembersInOrg({
+                org: context.repo.owner,
+                team_slug: teamSlug,
+              });
+              console.log(`List members response: ${resMembers.status}`);
+
+              members = resMembers.data.map(item => { return item.login })
+              console.log(`Members: ${members}`);
+
+            }
+            catch(err) {
+              console.log(err);
+            }
+
+            return members;
+      - run: echo "${{steps.team-members.outputs.result}}"
+
+      # get commit SHAs with additions
+      - name: Get addition commit SHAs
+        id: commit-shas
+        run: |
+          shas=$(git log --diff-filter=A --pretty='%H')
+          shas=${shas[@]}
+          echo "::set-output name=sha_list::$shas"
+
+      # get list of branches
+      - name: Get branch list
+        id: branch-list
+        run: |
+          branches=$(git for-each-ref --format='%(refname:short)' refs/heads/)
+          branches=${branches[@]//status/}
+          branches=${branches[@]//feedback/}
+          echo "::set-output name=branch_list::$branches"
+
+      # test activity 2 - commits
+      - uses: actions/github-script@v5
+        name: "Check Activity 2"
+        id: activity2
+        env:
+          MEMBERS: ${{ steps.team-members.outputs.result }}
+          COMMIT_SHAS: ${{ steps.commit-shas.outputs.sha_list }}
+          BRANCHES: ${{ steps.branch-list.outputs.branch_list }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const members = JSON.parse(process.env.MEMBERS);
+            const additionSHAs = process.env.COMMIT_SHAS.split(" ");
+            const branches = process.env.BRANCHES.split(" ");
+
+            let noCommitMembers = [];
+            let result = 'fail';
+
+            // loop through members
+            for (const member of members) {
+              let commitFound = false;
+              // loop through branches
+              for (const branch of branches) {
+                // get commits, filtered by actor and branch
+                const res = await github.rest.repos.listCommits({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  author: member,
+                  sha: branch,
+                  per_page: 100
+                });
+                console.log(`List commits for ${member} on ${branch} response: ${res.status}`);
+
+                const commitSHAs = res.data.map(item => item.sha);
+
+                if (additionSHAs.some(v => commitSHAs.includes(v))) {
+                  commitFound = true;
+                  break;
+                }
+              }
+
+              if (commitFound) {
+                console.log(`${member} has committed a file`);
+              }
+              else {
+                console.log("No addition commits found");
+                console.log(`${member} has not committed a file`);
+                noCommitMembers.push(member);
+              }
+            }
+
+            // is noCommitMembers list non-zero
+            if (noCommitMembers.length) {
+              console.log("Members found with no commits");
+              result = 'fail';
+            }
+            else {
+              console.log("No members found who have made no commits")
+
+              // write result to file
+              const fs = require('fs');
+              fs.writeFile('.github/results/activity2.txt', 'pass', function (err) {
+                if (err) return console.log(err);
+              });
+
+              result = 'success';
+            }
+            core.setOutput('no_commits', noCommitMembers);
+            return result
+
+      # test activity 3 - open PR
+      - uses: actions/github-script@v5
+        name: "Check Activity 3"
+        id: activity3
+        env:
+          MEMBERS: ${{ steps.team-members.outputs.result }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const members = JSON.parse(process.env.MEMBERS);
+            let noPRMembers = [];
+            let result = 'fail';
+
+            const res = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all'
+            });
+            console.log(`List PR response: ${res.status}`);
+
+            prAuthors = res.data.map(item => item.user.login);
+
+            for (const member of members) {
+              if (! prAuthors.includes(member)) {
+                noPRMembers.push(member);
+              }
+            }
+
+            // is noPRMembers list non-zero
+            if (noPRMembers.length) {
+              console.log("Members found with no PRs");
+              result = 'fail';
+            }
+            else {
+              console.log("No members found who have not opened a PR")
+
+              // write result to file
+              const fs = require('fs');
+              fs.writeFile('.github/results/activity3.txt', 'pass', function (err) {
+                if (err) return console.log(err);
+              });
+
+              result = 'success';
+            }
+            core.setOutput('no_pr', noPRMembers);
+            return result
+
+      # test activity 4 - comment on PR
+      - uses: actions/github-script@v5
+        name: "Check Activity 4"
+        id: activity4
+        env:
+          MEMBERS: ${{ steps.team-members.outputs.result }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const members = JSON.parse(process.env.MEMBERS);
+            let noCommentMembers = [];
+            let result = 'fail';
+
+            const resAllPR = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'all'
+            });
+            console.log(`List PR response: ${resAllPR.status}`);
+
+            for (const member of members) {
+              let commentFound = false;
+
+              const prIDs = resAllPR.data.filter(item => (! ["github-classroom[bot]", member].includes(item.user.login))).map(item => item.number);
+
+              if (prIDs.length) {
+                for (id of prIDs) {
+                  const resPRComments = await github.rest.issues.listComments({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: id,
+                    per_page: 100
+                  });
+                  console.log(`List PR ${id} comments response: ${resPRComments.status}`);
+
+                  const commentAuthors = resPRComments.data.map(item => item.user.login);
+
+                  if (commentAuthors.includes(member)) {
+                    commentFound = true;
+                    break;
+                  }
+                }
+              }
+
+              if (commentFound) {
+                console.log(`${member} has commented on another's PR`);
+              }
+              else {
+                console.log(`${member} has not commented on a PR`);
+                noCommentMembers.push(member);
+              }
+            }
+
+            // is noCommentMembers list non-zero
+            if (noCommentMembers.length) {
+              console.log("Members found with no comments");
+              result = 'fail';
+            }
+            else {
+              console.log("No members found who have not commented on PRs")
+
+              // write result to file
+              const fs = require('fs');
+              fs.writeFile('.github/results/activity4.txt', 'pass', function (err) {
+                if (err) return console.log(err);
+              });
+
+              result = 'success';
+            }
+            core.setOutput('no_comments', noCommentMembers);
+            return result
+
+      # get merge commit SHAs
+      - name: Get merge commit SHAs
+        id: merge-shas
+        run: |
+          shas=$(git log --branches --merges --pretty='%H')
+          shas=${shas[@]}
+          echo "::set-output name=sha_list::$shas"
+
+      # test activity 5 - merge commit
+      - uses: actions/github-script@v5
+        name: "Check Activity 5"
+        id: activity5
+        env:
+          MEMBERS: ${{ steps.team-members.outputs.result }}
+          MERGE_SHAS: ${{ steps.merge-shas.outputs.sha_list }}
+          BRANCHES: ${{ steps.branch-list.outputs.branch_list }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const members = JSON.parse(process.env.MEMBERS);
+            const mergeSHAs = process.env.MERGE_SHAS.split(" ");
+            const branches = process.env.BRANCHES.split(" ");
+
+            let noMergeMembers = [];
+            let result = 'fail';
+
+            // check array has values
+            if (mergeSHAs.length && mergeSHAs[0].length) {
+              // loop through members
+              for (const member of members) {
+                let commitFound = false;
+                // loop through branches
+                for (const branch of branches) {
+                  // get commits, filtered by actor and branch
+                  const res = await github.rest.repos.listCommits({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    author: member,
+                    sha: branch,
+                    per_page: 100
+                  });
+                  console.log(`List commits for ${member} on ${branch} response: ${res.status}`);
+
+                  const commitSHAs = res.data.map(item => item.sha);
+
+                  if (mergeSHAs.some(v => commitSHAs.includes(v))) {
+                    commitFound = true;
+                    break;
+                  }
+                }
+
+                if (commitFound) {
+                  console.log(`${member} has committed a file`);
+                }
+                else {
+                  console.log("No addition commits found");
+                  console.log(`${member} has not committed a file`);
+                  noMergeMembers.push(member);
+                }
+              }
+            }
+            else {
+              noMergeMembers = members;
+            }
+
+            // is noMergeMembers list non-zero
+            if (noMergeMembers.length) {
+              console.log("Members found with no commits");
+              result = 'fail';
+            }
+            else {
+              console.log("No members found who have made no commits")
+
+              // write result to file
+              const fs = require('fs');
+              fs.writeFile('.github/results/activity2.txt', 'pass', function (err) {
+                if (err) return console.log(err);
+              });
+
+              result = 'success';
+            }
+            core.setOutput('no_merges', noMergeMembers);
+            return result
+            
+      # run grading
+      # add id to step so outputs can be referenced
+      - uses: education/autograding@v1
+        name: "** Grading and Feedback **"
+        id: autograding
+        continue-on-error: true
+
+    outputs:
+      grading-score: ${{ steps.autograding.outputs.Points }}
+      activity1-result: ${{ steps.activity1.outputs.result }}
+      pages-url: ${{ steps.activity1.outputs.url }}
+      pages-branch: ${{steps.activity1.outputs.branch}}
+      pages-path: ${{steps.activity1.outputs.path}}
+      team-members: ${{steps.team-members.outputs.result}}
+      activity2-result: ${{ steps.activity2.outputs.result }}
+      no-commits: ${{ steps.activity2.outputs.no_commits }}
+      activity3-result: ${{ steps.activity3.outputs.result }}
+      no-pr: ${{ steps.activity3.outputs.no_pr }}
+      activity4-result: ${{ steps.activity4.outputs.result }}
+      no-comments: ${{ steps.activity4.outputs.no_comments }}
+      activity5-result: ${{ steps.activity5.outputs.result }}
+      no-merges: ${{ steps.activity5.outputs.no_merges }}
+
+  # job to get repo info: default branch, feedback pr number
+  repo-info:
+    name: Get Repo Info
+    runs-on: ubuntu-latest
+    steps:
+      # pause to wait for classroom bot to setup feedback PR
+      - if: ${{ github.actor == 'github-classroom[bot]' }}
+        run: sleep 30
+
+      # Default branch is usually 'main', but in case it isn't get default branch name
+      - name: Get default branch name
+        uses: actions/github-script@v5
+        id: default-branch-name
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            // get default branch
+            const repo = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            console.log(`Get repo response - status: ${repo.status}`);
+            return repo.data.default_branch;
+          result-encoding: string
+
+      - run: echo "Default branch name - ${{ steps.default-branch-name.outputs.result }}"
+
+      # find PR if it exists
+      - name: Find PR number
+        uses: markpatterson27/find-pull-request-action@pre-pr-release
+        id: check-pr
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          title: Feedback
+          base: feedback
+          branch: ${{ steps.default-branch-name.outputs.result }}
+          state: all
+      - run: echo ${{ steps.check-pr.outputs.number }}
+
+      # re-open PR if closed
+      - name: Re-open PR
+        if: ${{ steps.check-pr.outputs.state == 'closed' }}
+        uses: actions/github-script@v5
+        env:
+            PR_NUMBER: ${{ steps.check-pr.outputs.number }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: process.env.PR_NUMBER,
+              state: 'open'
+            });
+
+    outputs:
+      default-branch-name: ${{ steps.default-branch-name.outputs.result }}
+      feedback-pr: ${{ steps.check-pr.outputs.number }}
+
+  # job to get repo info: default branch, feedback pr number
+  repo-stats:
+    name: Get Repo Stats
+    runs-on: ubuntu-latest
+    # run even if autograding fails. only run on main branch and if pr exists.
+    if: ${{ always() && github.ref == 'refs/heads/main' && github.actor != 'github-classroom[bot]' }}
+    steps:
+      # checkout files so can access template
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      # # install git-hours
+      # # installing currently takes too long. TODO: find quicker option
+      # - uses: actions/setup-node@v2
+      #   with:
+      #     node-version: '14'
+      # - run: npm install -g git-hours
+
+      - uses: actions/github-script@v5
+        name: "Get repo user stats"
+        id: user-stats
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const cp = require('child_process');
+
+            // commit authors to ignore
+            const ignoreAuthors = [
+                'GitHub Action',
+                'github-classroom[bot]',
+                'Not Committed Yet'
+            ];
+
+            // get commits
+            commitCount = cp
+            .execSync("git shortlog -s -n --all --no-merges")
+            .toString()
+            .trim()
+            .split(/\r?\n/);
+            //console.log(commitCount);
+
+            stats = Object.assign({}, ...commitCount.map(element => {
+                e = element.trim().split(/(?<=^\S+)\s/);
+                if (!ignoreAuthors.includes(e[1])) return ({[e[1]]: {'commits': e[0]}});
+                })
+            );
+            //console.log(stats);
+
+            // get lines
+            lineCount = cp
+            .execSync("git ls-files | xargs -n1 git blame --line-porcelain | sed -n 's/^author //p' | sort -f | uniq -ic")
+            .toString()
+            .trim()
+            .split(/\r?\n/);
+            //console.log(lineCount);
+
+            // merge lines into stats
+            for (item of lineCount) {
+                e = item.trim().split(/(?<=^\S+)\s/);
+                if (ignoreAuthors.includes(e[1])) continue;
+                stats[e[1]]['linecount'] = e[0]
+            }
+            console.log(`Commit and line stats: ${stats}`);
+
+            // // get hours
+            // hours = cp
+            // .execSync("git-hours")
+            // .toString()
+            // .trim();
+            // hours = JSON.parse(hours);
+            // console.log(hours);
+
+            // // merge hours into stats
+            // for (item in hours) {
+            //     if (item == 'total') continue;
+            //     stats[hours[item].name]['hours'] = hours[item].hours
+            // }
+            // console.log(stats);
+
+            // get GitHub username
+            for (item in stats) {
+                // get last commit SHA
+                lastSHA = cp
+                .execSync(`git log -1 --all --author="${item}" --pretty=format:"%H"`)
+                .toString()
+                .trim()
+                //console.log(lastSHA);
+
+                if (lastSHA.length) {
+                  // get commit from GitHub
+                  const res = await github.rest.repos.getCommit({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      ref: lastSHA,
+                  });
+                  console.log(`Get commit response: ${res.status}`);
+                  //console.log(res.data.author.login);
+                  stats[item]['username'] = res.data.author.login;
+                }
+            }
+            //console.log(stats);
+
+            // map stats to GH usernames
+            const userStats = Object.keys(stats).reduce((r,a) => {
+              e = stats[a];
+              r[e.username] = r[e.username] || {};
+
+              for (k in e) {
+                if (k == 'username') continue;
+                // console.log(k)
+                r[e.username][k] = (r[e.username][k]) ? r[e.username][k] + parseInt(e[k]) : parseInt(e[k]);
+              }
+              return r;
+            }, {});
+            console.log(`User stats: ${userStats}`);
+            return userStats;
+
+    outputs:
+      user-stats: ${{ steps.user-stats.outputs.result }}
+
+  # job to build activity status icons and update pages URL
+  update-activity-status:
+    name: Update Activity Statuses
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [grade, repo-info]
+    steps:
+      # need to checkout whole repo
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      # switch to main branch
+      - name: Switch to main branch
+        run: git checkout ${{ needs.repo-info.outputs.default-branch-name }}
+
+      # update pages URL
+      - name: update Pages URL
+        if: ${{ needs.grade.outputs.pages-url != '' }}
+        run: |
+          replace="When enabled, your site will be available at: \`https:\/\/<org name>.github.io\/<repo name>\`"
+          with="Your site is available at: [${{ needs.grade.outputs.pages-url }}](${{ needs.grade.outputs.pages-url }})"
+          sed -i "s|^$replace|$with|g" README.md
+
+      # un-update pages URL if gh pages disabled after enabling
+      - name: un-update Pages URL
+        if: ${{ needs.grade.outputs.pages-url == '' }}
+        run: |
+          IFS='/' read -ra repoArray <<< "$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')"
+          replace="Your site is available at: \[https:\/\/${repoArray[0]}.github.io\/${repoArray[1]}\/\](https:\/\/${repoArray[0]}.github.io\/${repoArray[1]}\/)"
+          with="When enabled, your site will be available at: \`https:\/\/<org name>.github.io\/<repo name>\`"
+          sed -i "s|^$replace|$with|g" README.md
+
+      # commit and push pages url if changed
+      - name: Commit changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add README.md
+          git commit -m "Updated pages URL" || exit 0
+          git push origin ${{ needs.repo-info.outputs.default-branch-name }}
+
+      # switch to status branch
+      - run: git checkout status || git checkout -b status
+
+      # make dir for activity status icons
+      - name: make icons dir
+        run: mkdir -p .github/activity-icons
+
+      # make/copy activity 1 icon
+      - name: activity 1 icon
+        run: |
+          echo ${{ needs.grade.outputs.activity1-result }}
+          if ${{ needs.grade.outputs.activity1-result == 'success' }}; then
+            cp .github/templates/activity-completed.svg .github/activity-icons/activity1.svg
+          else
+            cp .github/templates/activity-incomplete.svg .github/activity-icons/activity1.svg
+          fi
+      
+      # make/copy activity 2 icon
+      - name: activity 2 icon
+        run: |
+          echo ${{ needs.grade.outputs.activity2-result }}
+          if ${{ needs.grade.outputs.activity2-result == 'success' }}; then
+            cp .github/templates/activity-completed.svg .github/activity-icons/activity2.svg
+          else
+            cp .github/templates/activity-incomplete.svg .github/activity-icons/activity2.svg
+          fi
+
+      # make/copy activity 3 icon
+      - name: activity 3 icon
+        run: |
+          echo ${{ needs.grade.outputs.activity3-result }}
+          if ${{ needs.grade.outputs.activity3-result == 'success' }}; then
+            cp .github/templates/activity-completed.svg .github/activity-icons/activity3.svg
+          else
+            cp .github/templates/activity-incomplete.svg .github/activity-icons/activity3.svg
+          fi
+
+      # make/copy activity 4 icon
+      - name: activity 4 icon
+        run: |
+          echo ${{ needs.grade.outputs.activity4-result }}
+          if ${{ needs.grade.outputs.activity4-result == 'success' }}; then
+            cp .github/templates/activity-completed.svg .github/activity-icons/activity4.svg
+          else
+            cp .github/templates/activity-incomplete.svg .github/activity-icons/activity4.svg
+          fi
+
+      # make/copy activity 5 icon
+      - name: activity 5 icon
+        run: |
+          echo ${{ needs.grade.outputs.activity5-result }}
+          if ${{ needs.grade.outputs.activity5-result == 'success' }}; then
+            cp .github/templates/activity-completed.svg .github/activity-icons/activity5.svg
+          else
+            cp .github/templates/activity-incomplete.svg .github/activity-icons/activity5.svg
+          fi
+
+      # create points bar
+      - name: points bar
+        uses: markpatterson27/points-bar@v1
+        with:
+          points: ${{ needs.grade.outputs.grading-score }}
+          path: '.github/activity-icons/points-bar.svg'
+
+      # commit and push activity icons if statuses have changed
+      - name: Commit changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add '.github/activity-icons'
+          git commit -m "Add/Update activity icons" || exit 0
+          git push origin status
+
+  # job to post feedback message in Feedback PR
+  # Classroom will create the PR when assignment accepted. PR should be issue 1.
+  post-feedback:
+    name: Post Feedback Comment
+    runs-on: ubuntu-latest
+    # run even if autograding fails. only run on main branch and if pr exists.
+    if: ${{ always() && needs.repo-info.outputs.feedback-pr != '' && github.ref == 'refs/heads/main' && github.actor != 'github-classroom[bot]' }}
+    needs: [grade, repo-info, repo-stats]
+    steps:
+      # checkout files so can access template
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      # read template
+      - uses: markpatterson27/markdown-to-output@v1
+        id: mto
+        with:
+          filepath: .github/templates/pr_feedback.md
+
+      # set feedback var
+      # activity 1 feedback
+      - name: activity 1 feedback
+        run: |
+          if ${{ needs.grade.outputs.activity1-result == 'success' }}; then
+            message="${{ steps.mto.outputs.activity1-success }}"
+            status="${{ steps.mto.outputs.status-success }}"
+          else
+            if ${{ needs.grade.outputs.pages-url != '' }}; then
+              message="${{ steps.mto.outputs.activity1-fail-2 }}"
+            else
+              message="${{ steps.mto.outputs.activity1-fail }}"
+            fi
+            status="${{ steps.mto.outputs.status-fail }}"
+          fi
+          echo "fb-activity1=$(/bin/bash .github/scripts/escape.sh "$message")" >> $GITHUB_ENV
+          echo "status-activity1=$(/bin/bash .github/scripts/escape.sh "$status")" >> $GITHUB_ENV
+
+      # activity 2 feedback
+      - name: activity 2 feedback
+        run: |
+          if ${{ needs.grade.outputs.activity2-result == 'success' }}; then
+            message="${{ steps.mto.outputs.activity2-success }}"
+            status="${{ steps.mto.outputs.status-success }}"
+          else
+            message="${{ steps.mto.outputs.activity2-fail }}"
+            status="${{ steps.mto.outputs.status-fail }}"
+
+            IFS=',][' read -ra teamMembers <<< "${{ needs.grade.outputs.no-commits }}"
+            members="$(printf -- "- %s\n" "${teamMembers[@]:1}")"
+            echo "no-commit-members=$(/bin/bash .github/scripts/escape.sh "$members")" >> $GITHUB_ENV
+          fi
+          echo "fb-activity2=$(/bin/bash .github/scripts/escape.sh "$message")" >> $GITHUB_ENV
+          echo "status-activity2=$(/bin/bash .github/scripts/escape.sh "$status")" >> $GITHUB_ENV
+
+      # activity 3 feedback
+      - name: activity 3 feedback
+        run: |
+          if ${{ needs.grade.outputs.activity3-result == 'success' }}; then
+            message="${{ steps.mto.outputs.activity3-success }}"
+            status="${{ steps.mto.outputs.status-success }}"
+          else
+            message="${{ steps.mto.outputs.activity3-fail }}"
+            status="${{ steps.mto.outputs.status-fail }}"
+
+            IFS=',][' read -ra teamMembers <<< "${{ needs.grade.outputs.no-pr }}"
+            members="$(printf -- "- %s\n" "${teamMembers[@]:1}")"
+            echo "no-pr-members=$(/bin/bash .github/scripts/escape.sh "$members")" >> $GITHUB_ENV
+          fi
+          echo "fb-activity3=$(/bin/bash .github/scripts/escape.sh "$message")" >> $GITHUB_ENV
+          echo "status-activity3=$(/bin/bash .github/scripts/escape.sh "$status")" >> $GITHUB_ENV
+
+      # activity 4 feedback
+      - name: activity 4 feedback
+        run: |
+          if ${{ needs.grade.outputs.activity4-result == 'success' }}; then
+            message="${{ steps.mto.outputs.activity4-success }}"
+            status="${{ steps.mto.outputs.status-success }}"
+          else
+            message="${{ steps.mto.outputs.activity4-fail }}"
+            status="${{ steps.mto.outputs.status-fail }}"
+
+            IFS=',][' read -ra teamMembers <<< "${{ needs.grade.outputs.no-comments }}"
+            members="$(printf -- "- %s\n" "${teamMembers[@]:1}")"
+            echo "no-comment-members=$(/bin/bash .github/scripts/escape.sh "$members")" >> $GITHUB_ENV
+          fi
+          echo "fb-activity4=$(/bin/bash .github/scripts/escape.sh "$message")" >> $GITHUB_ENV
+          echo "status-activity4=$(/bin/bash .github/scripts/escape.sh "$status")" >> $GITHUB_ENV
+
+      # activity 5 feedback
+      - name: activity 5 feedback
+        run: |
+          if ${{ needs.grade.outputs.activity5-result == 'success' }}; then
+            message="${{ steps.mto.outputs.activity5-success }}"
+            status="${{ steps.mto.outputs.status-success }}"
+          else
+            message="${{ steps.mto.outputs.activity5-fail }}"
+            status="${{ steps.mto.outputs.status-fail }}"
+
+            IFS=',][' read -ra teamMembers <<< "${{ needs.grade.outputs.no-merges }}"
+            members="$(printf -- "- %s\n" "${teamMembers[@]:1}")"
+            echo "no-merge-members=$(/bin/bash .github/scripts/escape.sh "$members")" >> $GITHUB_ENV
+          fi
+          echo "fb-activity5=$(/bin/bash .github/scripts/escape.sh "$message")" >> $GITHUB_ENV
+          echo "status-activity5=$(/bin/bash .github/scripts/escape.sh "$status")" >> $GITHUB_ENV
+
+      # list team members
+      - name: list team members
+        run: |
+          IFS=',][' read -ra teamMembers <<< "${{ needs.grade.outputs.team-members }}"
+          members=""
+          newline=$'\n'
+          for member in "${teamMembers[@]:1}"; do
+            name=$(curl -H "Accept: application/vnd.github.v3+json" -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" https://api.github.com/users/$member | jq -r 'select(.name != null) | .name')
+            members="${members}- ${name} [$member](https://github.com/$member)$newline"
+          done
+          # members="$(printf -- "- %s\n" "${teamMembers[@]:1}")"
+          echo "team-members=$(/bin/bash .github/scripts/escape.sh "$members")" >> $GITHUB_ENV
+
+      # generate team member stats
+      - name: generate member stats
+        id: member-stats
+        uses: actions/github-script@v5
+        env:
+          MEMBERS: ${{ needs.grade.outputs.team-members }}
+          USERSTATS: ${{ needs.repo-stats.outputs.user-stats }}
+        with:
+          script: |
+            const members = JSON.parse(process.env.MEMBERS);
+            const userStats = JSON.parse(process.env.USERSTATS);
+
+            let memberStats = {};
+            for (const member of members) {
+              memberStats[member] = {};
+              memberStats[member]['commits'] = (userStats[member]) ? userStats[member].commits : 0;
+              memberStats[member]['linecount'] = (userStats[member]) ? userStats[member].linecount : 0;
+            }
+
+            // calc overall geomean
+            for (const k in memberStats){
+              const overall = Math.sqrt(memberStats[k].commits * memberStats[k].linecount / 10);
+              memberStats[k]['overall'] = overall;
+            }
+            console.log(memberStats);
+
+            // calc totals
+            const totals = Object.keys(memberStats).reduce((r,a) => {
+              e = memberStats[a];
+              for (k in e) {
+                r[k] = (r[k]) ? r[k] + e[k] : e[k];
+              }
+              return r;
+            }, {});
+            console.log(totals);
+
+            let tableBody = "";
+            for (const e in memberStats){
+              const commits = memberStats[e].commits;
+              const commitsP = (memberStats[e].commits*100/totals.commits).toFixed(2);
+              const lines = memberStats[e].linecount;
+              const linesP = (memberStats[e].linecount*100/totals.linecount).toFixed(2);
+              const overall = (memberStats[e].overall*100/totals.overall).toFixed(2);
+
+              tableBody += `| ${e} | ${commits} | ${commitsP}% | ${lines} | ${linesP}% | ${overall}% |\n`;
+            }
+            return tableBody
+          result-encoding: string
+
+      # replace tokens
+      # read template file and replace tokens. token replacement based on env name.
+      - name: prepare comment and substitute tokens
+        id: prep
+        uses: actions/github-script@v5
+        env:
+          pages-url: ${{ needs.grade.outputs.pages-url }}
+          pages-branch: ${{ needs.grade.outputs.pages-branch }}
+          pages-path: ${{ needs.grade.outputs.pages-path }}
+          points: ${{ needs.grade.outputs.grading-score }}
+          template: ${{ steps.mto.outputs.body }}
+          team-stats: ${{ steps.member-stats.outputs.result }}
+        with:
+          script: |
+            const fs = require('fs')
+            let commentBody = process.env.template
+
+            for (envName in process.env) {
+              commentBody = commentBody.replace("${"+envName+"}", process.env[envName]
+                .replace(/%0D/g, '\r')
+                .replace(/%0A/g, '\n')
+                .replace(/%25/g, '\%'))
+            }
+
+            // additional env re-replace
+            activityMessageEnv = ["no-commit-members", "no-pr-members", "no-comment-members", "no-merge-members"]
+            for (envName of activityMessageEnv) {
+              commentBody = commentBody.replace("${"+envName+"}", process.env[envName]
+                .replace(/%0D/g, '\r')
+                .replace(/%0A/g, '\n')
+                .replace(/%25/g, '\%'))
+            }
+
+            return commentBody
+          result-encoding: string
+     
+      # hide old feedback comments
+      - name: hide old feedback comments
+        uses: kanga333/comment-hider@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          issue_number: ${{ needs.repo-info.outputs.feedback-pr }}
+
+      # post comment on feedback PR. issues and PRs have same numbers
+      - name: post comment
+        uses: actions/github-script@v5
+        env:
+          MESSAGE: ${{ steps.prep.outputs.result }}
+          ISSUE: ${{ needs.repo-info.outputs.feedback-pr }}
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          script: |
+            const { MESSAGE, ISSUE } = process.env
+            await github.rest.issues.createComment({
+              issue_number: process.env.ISSUE,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `${MESSAGE}`
+            })
